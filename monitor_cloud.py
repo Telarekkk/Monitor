@@ -1,10 +1,8 @@
 import requests
 from bs4 import BeautifulSoup
 import time
-import json
 import os
 from datetime import datetime
-from pathlib import Path
 import hashlib
 import smtplib
 from email.mime.text import MIMEText
@@ -13,22 +11,26 @@ from email.mime.multipart import MIMEMultipart
 # ─────────────────────────────────────────────
 #  Konfiguracja ze zmiennych środowiskowych
 # ─────────────────────────────────────────────
-BASE_URL      = "https://www.autazeszwajcarii.pl/aukcje/?type=&brand=&run_from=&run_to=&production_date_from=&production_date_to=&phrase="
-EMAIL_SENDER  = "firmowypprolki@gmail.com"
-EMAIL_PASSWORD = "xsqa lyio wsvi nfvz"
-SMTP_SERVER   = "smtp.gmail.com"
-SMTP_PORT     = 587
-DATA_FILE     = "ogloszenia.json"
+BASE_URL       = "https://www.autazeszwajcarii.pl/aukcje/?type=&brand=&run_from=&run_to=&production_date_from=&production_date_to=&phrase="
+EMAIL_SENDER   = "firmowypprolki@gmail.com"
+SMTP_SERVER    = "smtp.gmail.com"
+SMTP_PORT      = 587
 
 # Zmienne środowiskowe ustawiane w Railway Dashboard:
+#   EMAIL_PASSWORD   → hasło aplikacji Gmail
 #   EMAIL_RECIPIENT  → adres email odbiorcy
 #   BRANDS           → marki oddzielone przecinkiem, np. "BMW,Audi,Toyota"
 #   INTERVAL_MINUTES → co ile minut sprawdzać (domyślnie 5)
+#   SHEET_URL        → URL do Google Sheets (tryb "Opublikuj jako CSV") — czytanie
+#   SHEET_POST_URL   → URL do Google Apps Script Web App — zapis
 
-RECIPIENT = os.environ.get("EMAIL_RECIPIENT", "")
-BRANDS_RAW = os.environ.get("BRANDS", "")
-INTERVAL_MINUTES = int(os.environ.get("INTERVAL_MINUTES", "5"))
-INTERVAL = INTERVAL_MINUTES * 60
+EMAIL_PASSWORD    = os.environ.get("EMAIL_PASSWORD", "")
+RECIPIENT         = os.environ.get("EMAIL_RECIPIENT", "")
+BRANDS_RAW        = os.environ.get("BRANDS", "")
+INTERVAL_MINUTES  = int(os.environ.get("INTERVAL_MINUTES", "5"))
+INTERVAL          = INTERVAL_MINUTES * 60
+SHEET_URL         = os.environ.get("SHEET_URL", "")       # CSV export URL
+SHEET_POST_URL    = os.environ.get("SHEET_POST_URL", "")  # Apps Script URL
 
 
 def log(msg):
@@ -40,8 +42,14 @@ def validate_config():
     errors = []
     if not RECIPIENT or "@" not in RECIPIENT:
         errors.append("Brak lub nieprawidlowy EMAIL_RECIPIENT")
+    if not EMAIL_PASSWORD:
+        errors.append("Brak EMAIL_PASSWORD")
     if not BRANDS_RAW.strip():
         errors.append("Brak zmiennej BRANDS (np. BMW,Audi)")
+    if not SHEET_URL:
+        errors.append("Brak SHEET_URL (CSV export z Google Sheets)")
+    if not SHEET_POST_URL:
+        errors.append("Brak SHEET_POST_URL (Google Apps Script URL)")
     if errors:
         for e in errors:
             log(f"BLAD KONFIGURACJI: {e}")
@@ -49,20 +57,59 @@ def validate_config():
         raise SystemExit(1)
 
 
-def load_data():
-    if Path(DATA_FILE).exists():
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            return {}
-    return {}
+# ─────────────────────────────────────────────
+#  Google Sheets — odczyt i zapis
+# ─────────────────────────────────────────────
+
+def load_known_ids():
+    """
+    Pobiera arkusz jako CSV i zwraca set znanych ID ogłoszeń.
+    Arkusz ma kolumny: id, title, link, source, found_at
+    """
+    try:
+        r = requests.get(SHEET_URL, timeout=15)
+        r.raise_for_status()
+        known = set()
+        lines = r.text.strip().splitlines()
+        for line in lines[1:]:  # pomiń nagłówek
+            if line.strip():
+                listing_id = line.split(",")[0].strip().strip('"')
+                if listing_id:
+                    known.add(listing_id)
+        log(f"Wczytano {len(known)} znanych ID z Google Sheets")
+        return known
+    except Exception as e:
+        log(f"BLAD odczytu z Google Sheets: {e}")
+        return set()
 
 
-def save_data(known):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(known, f, ensure_ascii=False, indent=2)
+def save_new_to_sheet(new_listings):
+    """
+    Wysyła nowe ogłoszenia do Google Apps Script, który dopisuje wiersze do arkusza.
+    Payload: JSON z listą {id, title, link, source, found_at}
+    """
+    if not new_listings:
+        return
+    try:
+        rows = []
+        for item in new_listings:
+            rows.append({
+                "id":       item["id"],
+                "title":    item["title"],
+                "link":     item["link"],
+                "source":   item["source"],
+                "found_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
+        r = requests.post(SHEET_POST_URL, json={"rows": rows}, timeout=15)
+        r.raise_for_status()
+        log(f"Zapisano {len(rows)} nowych wierszy do Google Sheets")
+    except Exception as e:
+        log(f"BLAD zapisu do Google Sheets: {e}")
 
+
+# ─────────────────────────────────────────────
+#  Scraping
+# ─────────────────────────────────────────────
 
 def fetch(session, url):
     try:
@@ -70,7 +117,7 @@ def fetch(session, url):
         r.raise_for_status()
         return r.text
     except Exception as e:
-        log(f"Blad pobierania: {e}")
+        log(f"Blad pobierania {url}: {e}")
         return None
 
 
@@ -88,10 +135,9 @@ def get_main_image(session, listing_url):
                 continue
             if ".jpg" in src or ".jpeg" in src or ".png" in src:
                 if not src.startswith("http"):
-                    if "autazeszwajcarii" in listing_url:
-                        src = f"https://autazeszwajcarii.pl{src}"
+                    src = f"https://autazeszwajcarii.pl{src}"
                 return src
-    except:
+    except Exception:
         pass
     return None
 
@@ -112,40 +158,38 @@ def parse(session, html, source_name):
             listing_id = hashlib.md5(full_url.encode()).hexdigest()
             image_url = get_main_image(session, full_url)
             listings.append({
-                "id": listing_id,
-                "title": title,
-                "link": full_url,
+                "id":     listing_id,
+                "title":  title,
+                "link":   full_url,
                 "source": source_name,
-                "image": image_url
+                "image":  image_url
             })
-        except:
+        except Exception:
             continue
     return listings
 
 
-def detect_new(known, listings):
+def detect_new(known_ids, listings):
     new = []
     for item in listings:
-        if item["id"] not in known:
-            known[item["id"]] = {
-                "title": item["title"],
-                "link": item["link"],
-                "image": item["image"],
-                "source": item["source"],
-                "found_at": datetime.now().isoformat()
-            }
+        if item["id"] not in known_ids:
+            known_ids.add(item["id"])
             new.append(item)
     return new
 
+
+# ─────────────────────────────────────────────
+#  Email
+# ─────────────────────────────────────────────
 
 def send_email(recipient, new_listings):
     if not new_listings:
         return
     try:
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"{len(new_listings)} nowe ogloszenie(a)"
-        msg["From"] = EMAIL_SENDER
-        msg["To"] = recipient
+        msg["Subject"] = f"{len(new_listings)} nowe ogloszenie(a) — Auto Monitor"
+        msg["From"]    = EMAIL_SENDER
+        msg["To"]      = recipient
 
         html = f"""
         <!DOCTYPE html>
@@ -162,8 +206,8 @@ def send_email(recipient, new_listings):
                 .content {{ padding: 30px; }}
                 .listings {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; width: 100%; }}
                 @media (max-width: 1200px) {{ .listings {{ grid-template-columns: repeat(3, 1fr); }} }}
-                @media (max-width: 768px) {{ .listings {{ grid-template-columns: repeat(2, 1fr); }} }}
-                @media (max-width: 480px) {{ .listings {{ grid-template-columns: 1fr; }} }}
+                @media (max-width: 768px)  {{ .listings {{ grid-template-columns: repeat(2, 1fr); }} }}
+                @media (max-width: 480px)  {{ .listings {{ grid-template-columns: 1fr; }} }}
                 .listing-card {{ background: #f9f9f9; border-radius: 10px; overflow: hidden; border-left: 4px solid #3e5dff; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
                 .listing-image {{ width: 100%; height: 160px; background: linear-gradient(135deg, #f0f0f0, #e0e0e0); object-fit: cover; display: block; }}
                 .listing-content {{ padding: 15px; }}
@@ -171,14 +215,13 @@ def send_email(recipient, new_listings):
                 .listing-brand {{ font-size: 12px; color: #3e5dff; font-weight: 600; margin: 6px 0; }}
                 .listing-link {{ display: inline-block; background: linear-gradient(135deg, #3e5dff, #2a3bcc); color: white; padding: 8px 12px; text-decoration: none; border-radius: 4px; font-weight: bold; font-size: 12px; margin-top: 8px; }}
                 .footer {{ text-align: center; padding: 25px 20px; background: #f5f5f5; border-top: 1px solid #ddd; color: #666; font-size: 12px; }}
-                .footer-text {{ margin: 5px 0; }}
             </style>
         </head>
         <body>
             <div class="container">
                 <div class="header">
-                    <h1>Nowe ogloszenia samochodów</h1>
-                    <p>Znaleziono {len(new_listings)} nowych ogloszeń</p>
+                    <h1>Nowe ogłoszenia samochodów</h1>
+                    <p>Znaleziono {len(new_listings)} nowych ogłoszeń</p>
                     <p>{datetime.now().strftime('%d.%m.%Y o %H:%M')}</p>
                 </div>
                 <div class="content">
@@ -193,7 +236,7 @@ def send_email(recipient, new_listings):
                             <div class="listing-content">
                                 <h3 class="listing-title">{item["title"]}</h3>
                                 <div class="listing-brand">Marka: {item["source"]}</div>
-                                <a href="{item["link"]}" class="listing-link">Owórz</a>
+                                <a href="{item["link"]}" class="listing-link">Otwórz</a>
                             </div>
                         </div>
             """
@@ -202,8 +245,8 @@ def send_email(recipient, new_listings):
                     </div>
                 </div>
                 <div class="footer">
-                    <p class="footer-text">Auto Monitor - Telarek ©</p>
-                    <p class="footer-text">Email wyslany automatycznie</p>
+                    <p>Auto Monitor - Telarek ©</p>
+                    <p>Email wysłany automatycznie</p>
                 </div>
             </div>
         </body>
@@ -215,10 +258,14 @@ def send_email(recipient, new_listings):
             server.starttls()
             server.login(EMAIL_SENDER, EMAIL_PASSWORD)
             server.send_message(msg)
-        log(f"Email wyslany do {recipient} ({len(new_listings)} ogloszenia)")
+        log(f"Email wyslany do {recipient} ({len(new_listings)} ogloszen)")
     except Exception as e:
         log(f"Blad emaila: {e}")
 
+
+# ─────────────────────────────────────────────
+#  Główna pętla
+# ─────────────────────────────────────────────
 
 def run_monitor(recipient, brands, interval):
     session = requests.Session()
@@ -226,17 +273,19 @@ def run_monitor(recipient, brands, interval):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     })
 
-    known = load_data()
     sites = {brand.strip(): f"{BASE_URL}{brand.strip()}" for brand in brands}
 
     log("=" * 55)
-    log("AUTO MONITOR uruchomiony w trybie chmurowym")
+    log("AUTO MONITOR uruchomiony — backend: Google Sheets")
     log(f"Email odbiorcy : {recipient}")
     log(f"Marki          : {', '.join(sites.keys())}")
     log(f"Interwal       : co {interval // 60} minut")
     log("=" * 55)
 
     while True:
+        # Zawsze świeży odczyt z Sheets na początku rundy
+        known_ids = load_known_ids()
+
         log("Rozpoczynam sprawdzanie ogloszen...")
         all_new = []
 
@@ -247,7 +296,7 @@ def run_monitor(recipient, brands, interval):
                 continue
             listings = parse(session, html, name)
             log(f"  Znaleziono {len(listings)} ogloszen dla {name}")
-            new = detect_new(known, listings)
+            new = detect_new(known_ids, listings)
             if new:
                 log(f"  >>> {len(new)} NOWYCH dla {name}!")
                 all_new.extend(new)
@@ -255,9 +304,9 @@ def run_monitor(recipient, brands, interval):
                 log(f"  Brak nowych dla {name}")
 
         if all_new:
-            log(f"RAZEM: {len(all_new)} nowych! Wysylam email...")
+            log(f"RAZEM: {len(all_new)} nowych! Zapisuje do Sheets i wysylam email...")
+            save_new_to_sheet(all_new)
             send_email(recipient, all_new)
-            save_data(known)
         else:
             log("Brak nowych ogloszen w tej rundzie.")
 
